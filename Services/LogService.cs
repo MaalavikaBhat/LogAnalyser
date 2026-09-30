@@ -49,7 +49,7 @@ namespace LogAnalyser.Services
                     tostring(customDimensions['Invocation ID']),
                     tostring(customDimensions['invocationId']),
                     tostring(customDimensions['invocation_id']))
-                | project operation_Id, invocationId, searchMessage = message),
+                | project timestamp, operation_Id, invocationId, searchMessage = message),
                 (exceptions
                 | extend invocationId = coalesce(
                     tostring(customDimensions['InvocationId']),
@@ -57,8 +57,9 @@ namespace LogAnalyser.Services
                     tostring(customDimensions['invocationId']),
                     tostring(customDimensions['invocation_id']))
                 | extend searchMessage = strcat(type, ': ', outerMessage, ' - ', innermostMessage)
-                | project operation_Id, invocationId, searchMessage)
-                | where searchMessage contains correlationId;
+                | project timestamp, operation_Id, invocationId, searchMessage)
+                | where searchMessage contains correlationId
+                | top 1 by timestamp desc;
             let opId =
                 toscalar(
                     matchingLogs
@@ -76,27 +77,29 @@ namespace LogAnalyser.Services
             union
                 (traces
                 | extend invocationId = coalesce(tostring(customDimensions['InvocationId']), tostring(customDimensions['Invocation ID']), tostring(customDimensions['invocationId']), tostring(customDimensions['invocation_id']))
-                | where (isnotempty(currentInvocationId) and invocationId == currentInvocationId) or (isempty(currentInvocationId) and operation_Id == opId)
+                | where operation_Id == opId and (isempty(currentInvocationId) or isempty(invocationId) or invocationId == currentInvocationId)
+                | extend message = strcat('Trace emitted by API/component ', cloud_RoleName, ': ', message)
                 | project timestamp, message, operation_Id, itemType = 'trace', invocationId),
                 (exceptions
                 | extend invocationId = coalesce(tostring(customDimensions['InvocationId']), tostring(customDimensions['Invocation ID']), tostring(customDimensions['invocationId']), tostring(customDimensions['invocation_id']))
-                | where (isnotempty(currentInvocationId) and invocationId == currentInvocationId) or (isempty(currentInvocationId) and operation_Id == opId)
-                | extend message = strcat(type, ': ', outerMessage, ' - ', innermostMessage)
+                | where operation_Id == opId and (isempty(currentInvocationId) or isempty(invocationId) or invocationId == currentInvocationId)
+                | extend message = strcat('Exception thrown by API/component ', cloud_RoleName, ': ', type, ': ', outerMessage, ' - ', innermostMessage)
                 | project timestamp, message, operation_Id, itemType = 'exception', invocationId),
                 (dependencies
                 | extend invocationId = coalesce(tostring(customDimensions['InvocationId']), tostring(customDimensions['Invocation ID']), tostring(customDimensions['invocationId']), tostring(customDimensions['invocation_id']))
-                | where (isnotempty(currentInvocationId) and invocationId == currentInvocationId) or (isempty(currentInvocationId) and operation_Id == opId)
-                | extend message = strcat(type, ' dependency ', name, ' to ', target, ' completed with ', resultCode)
+                | where operation_Id == opId and (isempty(currentInvocationId) or isempty(invocationId) or invocationId == currentInvocationId)
+                | extend message = strcat('Downstream dependency called by API/component ', cloud_RoleName, ': ', type, ' ', name, ' to ', target, ' completed with ', resultCode, '; success=', success)
                 | project timestamp, message, operation_Id, itemType = 'dependency', invocationId),
                 (requests
                 | extend invocationId = coalesce(tostring(customDimensions['InvocationId']), tostring(customDimensions['Invocation ID']), tostring(customDimensions['invocationId']), tostring(customDimensions['invocation_id']))
-                | where (isnotempty(currentInvocationId) and invocationId == currentInvocationId) or (isempty(currentInvocationId) and operation_Id == opId)
-                | extend message = strcat('Request ', name, ' ', url, ' completed with ', resultCode)
+                | where operation_Id == opId and (isempty(currentInvocationId) or isempty(invocationId) or invocationId == currentInvocationId)
+                | extend message = strcat('API request handled by ', cloud_RoleName, ': ', name, ' ', url, ' completed with ', resultCode, '; success=', success)
                 | project timestamp, message, operation_Id, itemType = 'request', invocationId),
                 (customEvents
                 | extend invocationId = coalesce(tostring(customDimensions['InvocationId']), tostring(customDimensions['Invocation ID']), tostring(customDimensions['invocationId']), tostring(customDimensions['invocation_id']))
-                | where (isnotempty(currentInvocationId) and invocationId == currentInvocationId) or (isempty(currentInvocationId) and operation_Id == opId)
-                | project timestamp, message = name, operation_Id, itemType = 'customEvent', invocationId)
+                | where operation_Id == opId and (isempty(currentInvocationId) or isempty(invocationId) or invocationId == currentInvocationId)
+                | extend message = strcat('Custom event emitted by API/component ', cloud_RoleName, ': ', name)
+                | project timestamp, message, operation_Id, itemType = 'customEvent', invocationId)
             | order by timestamp asc
             | take 500
             ";
@@ -130,9 +133,19 @@ namespace LogAnalyser.Services
             {
                 var timestamp = row[0];
                 var message = row[1]?.ToString();
-                operationId = row[2]?.ToString() ?? operationId;
+                var rowOperationId = row[2]?.ToString();
+                if (!string.IsNullOrWhiteSpace(rowOperationId))
+                {
+                    operationId = rowOperationId;
+                }
+
                 var itemType = row[3]?.ToString() ?? "log";
-                invocationId = row[4]?.ToString() ?? invocationId;
+                var rowInvocationId = row[4]?.ToString();
+                if (!string.IsNullOrWhiteSpace(rowInvocationId))
+                {
+                    invocationId = rowInvocationId;
+                }
+
                 logs.Add($"{timestamp} [{itemType}]: {message}");
             }
 

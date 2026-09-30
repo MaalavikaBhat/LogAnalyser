@@ -25,6 +25,11 @@ namespace LogAnalyser.Services
                 The signature is used to find earlier occurrences. Do not include correlation IDs, operation IDs, timestamps,
                 request IDs, user data, or other incident-specific values in normalizedMessage.
 
+                Derive the signature from the primary failure using this precedence: exception, failed dependency, failed request.
+                For an HTTP request failure without a more specific exception, use exceptionType RequestFailure, use the exact
+                handling API/component name shown in the timeline, base normalizedMessage on the failed request while preserving
+                its stable route or operation name, and return only the numeric HTTP status in errorCode.
+
                 Timeline:
                 - {timeline}
             ";

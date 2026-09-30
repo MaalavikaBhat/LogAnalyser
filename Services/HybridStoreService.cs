@@ -289,17 +289,16 @@ namespace LogAnalyser.Services
             string currentInvocationId,
             CancellationToken cancellationToken = default)
         {
-            if (IsUnknown(signature.ExceptionType) || IsUnknown(signature.Component))
-            {
-                return new List<HistoricalIncidentMatch>();
-            }
-
+            var searchSignature = await GetIndexedSignatureAsync(
+                currentCorrelationId,
+                signature,
+                cancellationToken);
             var query = string.Join(" ", new[]
             {
-                signature.ExceptionType,
-                signature.Component,
-                signature.ErrorCode,
-                signature.NormalizedMessage
+                searchSignature.ExceptionType,
+                searchSignature.Component,
+                searchSignature.ErrorCode,
+                searchSignature.NormalizedMessage
             }.Where(value => !string.IsNullOrWhiteSpace(value)));
             var queryEmbedding = await _embeddingService.GetEmbeddingAsync(query, cancellationToken);
             var embeddingMemory = queryEmbedding is float[] array
@@ -352,9 +351,21 @@ namespace LogAnalyser.Services
             await foreach (var result in response.Value.GetResultsAsync())
             {
                 var incident = result.Document;
-                if (result.Score < _options.SimilarityThreshold ||
-                    !MetadataMatches(signature.ExceptionType, incident.ExceptionType) ||
-                    !MetadataMatches(signature.Component, incident.Component))
+                var score = result.Score ?? 0;
+                if (score < _options.SimilarityThreshold)
+                {
+                    continue;
+                }
+
+                var exceptionTypeMatches = !IsUnknown(searchSignature.ExceptionType) &&
+                    MetadataMatches(searchSignature.ExceptionType, incident.ExceptionType);
+                var componentMatches = !IsUnknown(searchSignature.Component) &&
+                    MetadataMatches(searchSignature.Component, incident.Component);
+                var metadataMatches = exceptionTypeMatches && componentMatches;
+                var errorCodeMatches = !string.IsNullOrWhiteSpace(searchSignature.ErrorCode) &&
+                    MetadataMatches(searchSignature.ErrorCode, incident.ErrorCode);
+
+                if (!metadataMatches && !errorCodeMatches)
                 {
                     continue;
                 }
@@ -362,8 +373,10 @@ namespace LogAnalyser.Services
                 matches.Add(new HistoricalIncidentMatch
                 {
                     Incident = incident,
-                    Score = result.Score ?? 0,
-                    SimilarityReason = "Matching exception type and component with similar normalized error content"
+                    Score = score,
+                    SimilarityReason = metadataMatches
+                        ? "Matching exception type and component with similar normalized error content"
+                        : "Matching error code with similar normalized error content"
                 });
             }
 
@@ -374,6 +387,45 @@ namespace LogAnalyser.Services
                 .ThenByDescending(match => match.Incident.Timestamp)
                 .Take(_options.ResultLimit)
                 .ToList();
+        }
+
+        private async Task<ErrorSignature> GetIndexedSignatureAsync(
+            string correlationId,
+            ErrorSignature fallback,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(correlationId))
+            {
+                return fallback;
+            }
+
+            var options = new SearchOptions
+            {
+                Size = 1,
+                Filter = $"correlationId eq '{EscapeOData(correlationId)}'",
+                Select = { "exceptionType", "component", "normalizedMessage", "errorCode" }
+            };
+
+            var response = await _searchClient.SearchAsync<LogDocument>(
+                "*",
+                options,
+                cancellationToken);
+
+            await foreach (var result in response.Value.GetResultsAsync())
+            {
+                var incident = result.Document;
+                return new ErrorSignature
+                {
+                    ExceptionType = incident.ExceptionType,
+                    Component = incident.Component,
+                    NormalizedMessage = incident.NormalizedMessage,
+                    ErrorCode = string.IsNullOrWhiteSpace(incident.ErrorCode)
+                        ? null
+                        : incident.ErrorCode
+                };
+            }
+
+            return fallback;
         }
 
         private static bool MetadataMatches(string currentValue, string historicalValue)
