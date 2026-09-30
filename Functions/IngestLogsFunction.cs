@@ -49,9 +49,9 @@ namespace LogAnalyser.Functions
                     tostring(customDimensions['Invocation ID']),
                     tostring(customDimensions['invocationId']),
                     tostring(customDimensions['invocation_id']))
+                | extend isFailure = severityLevel >= 3 or message contains 'Error' or message contains 'Exception' or message contains 'Timeout'
                 | project timestamp, message, operation_Id, invocationId, itemType = 'trace',
-                    exceptionType = '', component = cloud_RoleName, errorCode = '',
-                    isFailure = severityLevel >= 3 or message contains 'Error' or message contains 'Exception' or message contains 'Timeout';
+                    exceptionType = iff(isFailure, 'TraceFailure', ''), component = cloud_RoleName, errorCode = '', isFailure;
 
                 let exceptionLogs = exceptions
                 | where timestamp > ago({_historyDays}d)
@@ -83,10 +83,11 @@ namespace LogAnalyser.Functions
                     tostring(customDimensions['Invocation ID']),
                     tostring(customDimensions['invocationId']),
                     tostring(customDimensions['invocation_id']))
+                | extend statusCode = toint(resultCode)
                 | extend logMessage = strcat('Request ', name, ' ', url, ' completed with ', resultCode)
                 | project timestamp, message = logMessage, operation_Id, invocationId, itemType = 'request',
-                    exceptionType = iff(success == false, 'RequestFailure', ''), component = cloud_RoleName,
-                    errorCode = resultCode, isFailure = success == false;
+                    exceptionType = iff(statusCode between (400 .. 599), 'RequestFailure', ''), component = cloud_RoleName,
+                    errorCode = resultCode, isFailure = statusCode between (400 .. 599);
 
                 let customEventLogs = customEvents
                 | where timestamp > ago({_historyDays}d)
@@ -101,8 +102,8 @@ namespace LogAnalyser.Functions
                 let allTelemetry = union traceLogs, exceptionLogs, dependencyLogs, requestLogs, customEventLogs
                 | where isnotempty(invocationId) and isnotempty(message);
 
-                let failingInvocations = allTelemetry
-                | where isFailure
+                let failingInvocations = requestLogs
+                | where isnotempty(invocationId) and isFailure
                 | distinct invocationId;
 
                 allTelemetry
@@ -206,8 +207,17 @@ namespace LogAnalyser.Functions
         private static LogDocument CreateIncidentDocument(IGrouping<string, HistoricalLogRow> group)
         {
             var rows = group.OrderBy(row => row.Timestamp).ToList();
-            var signatureRow = rows.FirstOrDefault(row => !string.IsNullOrWhiteSpace(row.ExceptionType))
+            var signatureRow = rows.FirstOrDefault(row =>
+                    row.ItemType == "exception" && !string.IsNullOrWhiteSpace(row.ExceptionType))
+                ?? rows.FirstOrDefault(row =>
+                    row.ItemType == "dependency" && !string.IsNullOrWhiteSpace(row.ExceptionType))
+                ?? rows.FirstOrDefault(row =>
+                    row.ItemType == "trace" && !string.IsNullOrWhiteSpace(row.ExceptionType))
+                ?? rows.FirstOrDefault(row =>
+                    row.ItemType == "request" && !string.IsNullOrWhiteSpace(row.ExceptionType))
                 ?? rows[0];
+            var requestErrorCode = rows.FirstOrDefault(row =>
+                row.ItemType == "request" && !string.IsNullOrWhiteSpace(row.ErrorCode))?.ErrorCode ?? string.Empty;
             var correlationId = rows
                 .Select(row => ExtractCorrelationIdFromMessage(row.Message))
                 .FirstOrDefault(value => !string.IsNullOrEmpty(value)) ?? string.Empty;
@@ -237,7 +247,9 @@ namespace LogAnalyser.Functions
                     ? "unknown"
                     : signatureRow.Component,
                 NormalizedMessage = normalizedMessage,
-                ErrorCode = signatureRow.ErrorCode
+                ErrorCode = string.IsNullOrWhiteSpace(signatureRow.ErrorCode)
+                    ? requestErrorCode
+                    : signatureRow.ErrorCode
             };
         }
 
